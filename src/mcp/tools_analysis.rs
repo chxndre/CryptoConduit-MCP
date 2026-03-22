@@ -13,8 +13,9 @@ use crate::core::analysis::fair_value::{
 use crate::core::analysis::{book_dynamics, momentum};
 use crate::core::monitor::state::{SharedState, TimestampedOrderBook};
 use crate::core::providers::binance::BinanceClient;
-use crate::core::providers::gamma::asset_to_underlying;
+use crate::core::providers::gamma::{asset_to_underlying, query_resolved_markets};
 use crate::core::providers::polymarket::PolymarketClient;
+use crate::core::types::ResolvedMarketSummary;
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct GetMarketAnalysisParams {
@@ -369,6 +370,32 @@ pub async fn handle_get_market_analysis(
         (up_analysis, down_analysis, ctx)
     };
 
+    // ── 2b. Historical fallback via resolved markets (Gamma API) ──
+    // When local order book history is empty and market type is short-term,
+    // query Gamma for resolved markets to provide historical context.
+    let resolved_context: Option<Vec<ResolvedMarketSummary>> = {
+        let history_empty = up_book
+            .as_ref()
+            .map_or(true, |b| b.snapshot_count_24h == 0)
+            && down_book
+                .as_ref()
+                .map_or(true, |b| b.snapshot_count_24h == 0);
+
+        if history_empty && (mt == "5m" || mt == "15m") {
+            let http_client = reqwest::Client::new();
+            match query_resolved_markets(&http_client, &asset, &mt, 24, 4).await {
+                Ok(markets) if !markets.is_empty() => Some(markets),
+                Ok(_) => None,
+                Err(e) => {
+                    tracing::debug!(error = %e, "Resolved market fallback failed");
+                    None
+                }
+            }
+        } else {
+            None
+        }
+    };
+
     // ── 3. Probability divergence (tiered model) ──
     let divergence_analysis = compute_divergence(
         &mt,
@@ -427,6 +454,7 @@ pub async fn handle_get_market_analysis(
             whale_buy_vol,
             whale_sell_vol,
             &recent_alerts,
+            &resolved_context,
         );
     }
 
@@ -442,6 +470,7 @@ pub async fn handle_get_market_analysis(
         whale_sell_vol,
         &recent_alerts,
         &market_ctx,
+        &resolved_context,
     )
 }
 
@@ -696,6 +725,7 @@ fn format_json(
     whale_buy_vol: f64,
     whale_sell_vol: f64,
     recent_alerts: &[String],
+    resolved_context: &Option<Vec<ResolvedMarketSummary>>,
 ) -> String {
     let mut result = serde_json::Map::new();
     result.insert("asset".into(), serde_json::json!(asset.to_uppercase()));
@@ -778,6 +808,33 @@ fn format_json(
     );
     result.insert("recent_alerts".into(), serde_json::json!(recent_alerts));
 
+    if let Some(resolved) = resolved_context {
+        let resolved_json: Vec<serde_json::Value> = resolved
+            .iter()
+            .map(|r| {
+                serde_json::json!({
+                    "timestamp": r.timestamp.to_rfc3339(),
+                    "volume_usd": r.volume_usd,
+                    "outcome": r.outcome,
+                    "was_active": r.was_active,
+                })
+            })
+            .collect();
+        let active_count = resolved.iter().filter(|r| r.was_active).count();
+        let total_volume: f64 = resolved.iter().map(|r| r.volume_usd).sum();
+        result.insert(
+            "historical_context".into(),
+            serde_json::json!({
+                "source": "gamma_resolved_markets",
+                "note": "Local order book history unavailable — showing resolved market data from Gamma API",
+                "samples": resolved.len(),
+                "active_count": active_count,
+                "total_volume_usd": total_volume,
+                "markets": resolved_json,
+            }),
+        );
+    }
+
     serde_json::to_string_pretty(&serde_json::Value::Object(result))
         .unwrap_or_else(|_| "Failed to serialize analysis".to_string())
 }
@@ -795,6 +852,7 @@ fn format_tabulated(
     whale_sell_vol: f64,
     recent_alerts: &[String],
     market_ctx: &MarketContext,
+    resolved_context: &Option<Vec<ResolvedMarketSummary>>,
 ) -> String {
     let mut out = String::new();
     out.push_str(&format!(
@@ -1037,6 +1095,64 @@ fn format_tabulated(
             "\n{} alert(s) in the last 10 minutes.\n",
             recent_alerts.len()
         ));
+    }
+
+    // ── Historical Context (fallback from resolved markets) ──
+    if let Some(resolved) = resolved_context {
+        out.push('\n');
+        out.push_str("### Historical Context (Gamma Resolved Markets)\n\n");
+        out.push_str("  _Local order book history unavailable — showing resolved market data._\n\n");
+
+        let active_count = resolved.iter().filter(|r| r.was_active).count();
+        let total_volume: f64 = resolved.iter().map(|r| r.volume_usd).sum();
+        let avg_volume = if !resolved.is_empty() {
+            total_volume / resolved.len() as f64
+        } else {
+            0.0
+        };
+
+        out.push_str(&format!(
+            "  {:<12} {:>8}    {:<12} {}\n",
+            "Samples", resolved.len(), "Active", active_count,
+        ));
+        out.push_str(&format!(
+            "  {:<12} {:>8}    {:<12} {}\n",
+            "Total Vol", fmt_usd(total_volume), "Avg Vol", fmt_usd(avg_volume),
+        ));
+        out.push('\n');
+
+        out.push_str(&format!(
+            "  {:<28} {:>12} {:>10} {:>8}\n",
+            "Window", "Volume", "Outcome", "Active"
+        ));
+        out.push_str(&format!("  {}\n", "-".repeat(62)));
+        for r in resolved {
+            out.push_str(&format!(
+                "  {:<28} {:>12} {:>10} {:>8}\n",
+                r.timestamp.format("%Y-%m-%d %H:%M UTC"),
+                fmt_usd(r.volume_usd),
+                r.outcome.as_deref().unwrap_or("pending"),
+                if r.was_active { "yes" } else { "no" },
+            ));
+        }
+
+        if active_count > 0 {
+            let activity_pct = (active_count as f64 / resolved.len() as f64) * 100.0;
+            out.push_str(&format!(
+                "\n{} {} {}m markets were active ({:.0}% of sampled windows), avg volume {}.\n",
+                asset.to_uppercase(),
+                mt,
+                mt,
+                activity_pct,
+                fmt_usd(avg_volume),
+            ));
+        } else {
+            out.push_str(&format!(
+                "\nNo active {} {} markets found in the sampled period.\n",
+                asset.to_uppercase(),
+                mt,
+            ));
+        }
     }
 
     out

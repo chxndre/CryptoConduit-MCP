@@ -457,6 +457,22 @@ pub struct ShortTermMarket {
     pub start_spot_price: Option<f64>,
 }
 
+// --- Resolved Market Summary ---
+// Used by the historical market query fallback in gamma.rs.
+// When JSONL logs are empty/disabled, resolved markets on Gamma provide
+// volume, outcome, and activity data retroactively.
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ResolvedMarketSummary {
+    pub slug: String,
+    pub asset: String,
+    pub timeframe: String,
+    pub timestamp: DateTime<Utc>,
+    pub volume_usd: f64,
+    pub outcome: Option<String>,
+    pub was_active: bool,
+}
+
 // --- Spot Price History ---
 // Extracted from market-scout src/strategy.rs
 // Ring buffer with binary search for historical price lookups.

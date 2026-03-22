@@ -11,7 +11,7 @@ use serde_json::Value;
 use std::collections::HashSet;
 use tracing::{debug, info, warn};
 
-use crate::core::types::{Direction, MarketConfig, ShortTermMarket};
+use crate::core::types::{Direction, MarketConfig, ResolvedMarketSummary, ShortTermMarket};
 
 const GAMMA_API: &str = "https://gamma-api.polymarket.com";
 
@@ -890,6 +890,102 @@ pub fn monthly_token_ids(markets: &[MarketConfig]) -> Vec<(String, String, Strin
         }
     }
     ids
+}
+
+// --- Historical market query fallback ---
+
+/// Query Gamma API for resolved short-term markets across a time range.
+/// Constructs slug patterns at regular intervals and returns volume + metadata
+/// from resolved markets. This works retroactively without prior logging since
+/// Gamma retains resolved market data indefinitely.
+///
+/// Parameters:
+/// - `asset`: lowercase ticker ("btc", "sol", etc.)
+/// - `timeframe`: "5m" or "15m"
+/// - `lookback_hours`: how far back to query
+/// - `sample_interval_hours`: gap between sample points (e.g., 1 = check one window per hour)
+pub async fn query_resolved_markets(
+    client: &Client,
+    asset: &str,
+    timeframe: &str,
+    lookback_hours: u64,
+    sample_interval_hours: u64,
+) -> Result<Vec<ResolvedMarketSummary>> {
+    let interval_secs: u64 = match timeframe {
+        "5m" => 300,
+        "15m" => 900,
+        _ => anyhow::bail!("Unsupported timeframe for resolved query: {}", timeframe),
+    };
+    let interval_min = (interval_secs / 60) as u32;
+
+    let now_ts = Utc::now().timestamp();
+    let start_ts = now_ts - (lookback_hours * 3600) as i64;
+    let step_secs = (sample_interval_hours * 3600) as i64;
+
+    let mut results = Vec::new();
+    let mut ts = start_ts;
+
+    while ts < now_ts {
+        // Align to window boundary
+        let window_start = (ts / interval_secs as i64) * interval_secs as i64;
+        let slug = short_term_slug(asset, interval_secs, window_start);
+
+        // Single API call — extract volume, settlement, and activity from one response
+        match fetch_gamma_event(client, &slug).await {
+            Ok(Some(event)) => {
+                let market_obj = event
+                    .get("markets")
+                    .and_then(|v| v.as_array())
+                    .and_then(|arr| arr.first());
+
+                if let Some(m) = market_obj {
+                    let volume = m
+                        .get("volumeNum")
+                        .and_then(|v| v.as_f64())
+                        .or_else(|| json_str(m, "volume").and_then(|v| v.parse().ok()))
+                        .unwrap_or(0.0);
+
+                    let outcomes = json_str_array(m, "outcomes").unwrap_or_default();
+                    let settlement = extract_settlement(m, &outcomes);
+                    let outcome = settlement.map(|d| format!("{}", d));
+
+                    let window_time = chrono::DateTime::from_timestamp(window_start, 0)
+                        .unwrap_or_else(|| Utc::now());
+
+                    results.push(ResolvedMarketSummary {
+                        slug,
+                        asset: asset.to_uppercase(),
+                        timeframe: timeframe.to_string(),
+                        timestamp: window_time,
+                        volume_usd: volume,
+                        outcome,
+                        was_active: volume > 0.0,
+                    });
+                }
+            }
+            Ok(None) => {
+                debug!(slug = %slug, "Resolved market not found");
+            }
+            Err(e) => {
+                debug!(slug = %slug, error = %e, "Failed to fetch resolved market");
+            }
+        }
+
+        ts += step_secs;
+
+        // Small delay between requests to respect rate limits
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+    }
+
+    info!(
+        asset = %asset,
+        timeframe = %timeframe,
+        lookback_hours = lookback_hours,
+        found = results.len(),
+        "Resolved market query complete"
+    );
+
+    Ok(results)
 }
 
 #[cfg(test)]

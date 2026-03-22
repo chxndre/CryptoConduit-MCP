@@ -182,7 +182,6 @@ impl PolymarketClient {
 
     /// Fetch historical midpoint prices from the CLOB prices-history endpoint.
     /// Returns a vec of (timestamp_ms, midpoint_price) sorted by time.
-    #[allow(dead_code)]
     pub async fn get_prices_history(&self, token_id: &str) -> Result<Vec<(i64, f64)>> {
         let url = format!(
             "{}/prices-history?market={}&interval=1d&fidelity=1",
@@ -241,7 +240,6 @@ impl PolymarketClient {
     }
 
     /// Convenience: fetch prices history filtered to a time range [start_ms, end_ms].
-    #[allow(dead_code)]
     pub async fn get_prices_history_for_range(
         &self,
         token_id: &str,
